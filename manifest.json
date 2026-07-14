@@ -1,0 +1,8 @@
+{
+  "short_name": "Книголюб",
+  "name": "Книжный переполох Офлайн",
+  "start_url": "./index.html",
+  "background_color": "#150d07",
+  "display": "standalone",
+  "theme_color": "#150d07"
+}

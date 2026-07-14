@@ -1,0 +1,1081 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Книголюб">
+<link rel="manifest" href="manifest.json">
+<title>Книголюб Офлайн</title>
+<style>
+  html, body { margin:0; padding:0; background:#150d07; overflow:hidden; font-family:-apple-system,Segoe UI,Roboto,sans-serif; user-select:none; touch-action:none; width:100%; height:100%; }
+  canvas { display:block; margin:0 auto; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+window.addEventListener('error', function(e){
+  var box = document.createElement('div');
+  box.style.cssText = 'position:fixed;inset:0;background:#1a0f08;color:#ffd27a;font:13px/1.5 monospace;padding:16px;overflow:auto;z-index:99999;white-space:pre-wrap;';
+  box.textContent = 'Ошибка в игре:\n' + (e.message || e) + '\n' + (e.filename ? (e.filename + ':' + e.lineno + ':' + e.colno) : '');
+  document.body.appendChild(box);
+});
+
+// Офлайн-кэш через отдельный sw.js: первое открытие по ссылке сохраняет игру
+// на устройство, дальше (в том числе офлайн) она подхватывается из кэша.
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch(function(){});
+}
+</script>
+<script>
+const canvas = document.getElementById("game");
+let ctx = canvas.getContext("2d");
+const staticCanvas = document.createElement("canvas");
+let sctx = staticCanvas.getContext("2d");
+const uiBarCanvas = document.createElement("canvas");
+let uictx = uiBarCanvas.getContext("2d");
+
+/* Кэшированный спрайт мягкого свечения — вместо создания градиента заново каждый кадр */
+const glowSprite = document.createElement("canvas");
+glowSprite.width = 256; glowSprite.height = 256;
+(function bakeGlowSprite(){
+  const gctx = glowSprite.getContext("2d");
+  const grad = gctx.createRadialGradient(128, 128, 0, 128, 128, 128);
+  grad.addColorStop(0, "rgba(255,198,115,1)");
+  grad.addColorStop(1, "rgba(255,198,115,0)");
+  gctx.fillStyle = grad;
+  gctx.fillRect(0, 0, 256, 256);
+})();
+
+/* ================= helpers ================= */
+function rr(x, y, w, h, r){
+  if (typeof r === "number") r = {tl:r, tr:r, br:r, bl:r};
+  ctx.beginPath();
+  ctx.moveTo(x + r.tl, y);
+  ctx.lineTo(x + w - r.tr, y);
+  ctx.arcTo(x + w, y, x + w, y + r.tr, r.tr);
+  ctx.lineTo(x + w, y + h - r.br);
+  ctx.arcTo(x + w, y + h, x + w - r.br, y + h, r.br);
+  ctx.lineTo(x + r.bl, y + h);
+  ctx.arcTo(x, y + h, x, y + h - r.bl, r.bl);
+  ctx.lineTo(x, y + r.tl);
+  ctx.arcTo(x, y, x + r.tl, y, r.tl);
+  ctx.closePath();
+}
+function softShadow(blur, color, dy){ ctx.shadowColor = color || "rgba(0,0,0,0.4)"; ctx.shadowBlur = blur; ctx.shadowOffsetY = dy===undefined?4:dy; }
+function noShadow(){ ctx.shadowColor = "transparent"; ctx.shadowBlur = 0; ctx.shadowOffsetY = 0; }
+
+const leather = ["#7B241C", "#145A32", "#1B4F72", "#5C4033", "#6C3483", "#935116"];
+const spineDeck = ["#7B241C","#922B21","#145A32","#186A3B","#1B4F72","#1F618D","#B7950B","#9A7D0A","#6C3483","#7D3C98","#935116","#A04000"];
+
+/* ================= адаптивная геометрия ================= */
+let WIDTH, HEIGHT, TOP_UI, FLOOR0_TOP, FLOOR0_LEDGE, FLOOR1_TOP, FLOOR1_LEDGE, MID_Y, LADDER_X, LEFT_X, RIGHT_X;
+let SLOTS = [];
+let vignette, glowSpots, shelfRows, dustParticles = [];
+
+function slotFor(floor, side){ return SLOTS.find(s => s.floor === floor && s.side === side); }
+function ledgeY(floor){ return floor === 0 ? FLOOR0_LEDGE : FLOOR1_LEDGE; }
+function laneTop(floor){ return floor === 0 ? FLOOR0_TOP : FLOOR1_TOP; }
+
+function buildSpines(bottomY, opts){
+  const arr = [];
+  let x = 6;
+  while (x < WIDTH - 6) {
+    const w = opts.wMin + Math.random() * opts.wRange;
+    const h = opts.hMin + Math.random() * opts.hRange;
+    const tilt = (opts.tilt && Math.random() < 0.12) ? (Math.random() - 0.5) * 0.35 : 0;
+    const color = spineDeck[Math.floor(Math.random() * spineDeck.length)];
+    const bands = opts.detail && Math.random() < 0.55;
+    const midDot = opts.detail && Math.random() < 0.3;
+    arr.push({ x, w, h, tilt, color, bands, midDot, bottomY });
+    x += w + opts.gapMin + Math.random() * opts.gapRange;
+  }
+  return arr;
+}
+
+function buildFloorRows(floor){
+  const top = laneTop(floor) + 6;
+  const bottom = ledgeY(floor);
+  const zoneH = Math.max(40, bottom - top);
+  const spacing = 42;
+  const numRows = Math.max(1, Math.round(zoneH / spacing));
+  const actualSpacing = zoneH / numRows;
+  const rows = [];
+  for (let k = 0; k < numRows; k++) {
+    const rowBottomY = top + actualSpacing * (k + 1) - 6;
+    rows.push({
+      bottomY: rowBottomY,
+      isLast: k === numRows - 1,
+      back:  buildSpines(rowBottomY, { wMin:6, wRange:6, hMin:14, hRange:9,  gapMin:0.5, gapRange:1, tilt:false, detail:false }),
+      front: buildSpines(rowBottomY, { wMin:8, wRange:8, hMin:18, hRange:12, gapMin:1,   gapRange:2, tilt:true,  detail:true })
+    });
+  }
+  return rows;
+}
+
+function computeLayout(){
+  TOP_UI = 56;
+  const usableH = HEIGHT - TOP_UI;
+  FLOOR0_TOP = TOP_UI + 6;
+  FLOOR0_LEDGE = TOP_UI + usableH * 0.42;
+  FLOOR1_TOP = FLOOR0_LEDGE + usableH * 0.16;
+  FLOOR1_LEDGE = HEIGHT - 14;
+  MID_Y = (FLOOR0_LEDGE + FLOOR1_TOP) / 2;
+  LADDER_X = WIDTH / 2;
+  LEFT_X = WIDTH * 0.26;
+  RIGHT_X = WIDTH * 0.74;
+  PAUSE_BTN = { x: WIDTH / 2, y: (TOP_UI - 6) / 2, r: 18 };
+
+  SLOTS = [
+    { id:"TL", floor:0, side:0, x:LEFT_X,  y:FLOOR0_LEDGE },
+    { id:"TR", floor:0, side:1, x:RIGHT_X, y:FLOOR0_LEDGE },
+    { id:"BL", floor:1, side:0, x:LEFT_X,  y:FLOOR1_LEDGE },
+    { id:"BR", floor:1, side:1, x:RIGHT_X, y:FLOOR1_LEDGE }
+  ];
+
+  vignette = ctx.createRadialGradient(WIDTH / 2, HEIGHT / 2, HEIGHT * 0.3, WIDTH / 2, HEIGHT / 2, HEIGHT * 0.75);
+  vignette.addColorStop(0, "rgba(0,0,0,0)");
+  vignette.addColorStop(1, "rgba(0,0,0,0.38)");
+
+  glowSpots = [];
+  [0, 1].forEach(floor => {
+    [0.12, 0.88].forEach(fx => {
+      const baseY = ledgeY(floor) - 2; // свеча стоит прямо на краю полки, где ловим книги
+      glowSpots.push({ x: WIDTH * fx, baseY, glowY: baseY - 26, r: 80 });
+    });
+  });
+
+  shelfRows = [buildFloorRows(0), buildFloorRows(1)];
+
+  dustParticles = [];
+  glowSpots.forEach(g => {
+    const n = 4 + Math.floor(Math.random() * 3);
+    for (let i = 0; i < n; i++) {
+      dustParticles.push({
+        baseX: g.x + (Math.random() - 0.5) * g.r * 1.3,
+        baseY: g.glowY + (Math.random() - 0.5) * g.r * 1.1,
+        phase: Math.random() * Math.PI * 2,
+        speed: 0.15 + Math.random() * 0.25,
+        drift: 8 + Math.random() * 14,
+        size: 0.6 + Math.random() * 1.1
+      });
+    }
+  });
+
+  if (typeof player !== "undefined") {
+    const keepId = player.currentSlot ? player.currentSlot.id : "BR";
+    player.currentSlot = SLOTS.find(s => s.id === keepId) || SLOTS[3];
+    player.x = player.currentSlot.x;
+    player.y = player.currentSlot.y;
+    books = [];
+  }
+
+  bakeStaticLayer();
+  bakeUIBar();
+}
+
+/* ================= Запекаем фон верхней панели (не меняется между кадрами) ================= */
+function bakeUIBar(){
+  uiBarCanvas.width = WIDTH; uiBarCanvas.height = TOP_UI;
+  const savedCtx = ctx;
+  ctx = uictx;
+  ctx.clearRect(0, 0, WIDTH, TOP_UI);
+  ctx.save();
+  softShadow(6, "rgba(0,0,0,0.4)", 2);
+  ctx.fillStyle = "rgba(20,13,7,0.9)";
+  rr(0, 0, WIDTH, TOP_UI - 6, { tl:0, tr:0, br:14, bl:14 });
+  ctx.fill();
+  noShadow();
+  ctx.restore();
+  ctx.strokeStyle = "rgba(212,175,55,0.4)"; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, TOP_UI - 6); ctx.lineTo(WIDTH, TOP_UI - 6); ctx.stroke();
+  ctx = savedCtx;
+}
+
+/* ================= Текстура дерева (запекается один раз) ================= */
+function drawWoodGrain(){
+  ctx.save();
+  ctx.globalAlpha = 0.5;
+  for (let i = 0; i < 26; i++) {
+    const y = Math.random() * HEIGHT;
+    const amp = 3 + Math.random() * 5;
+    const shade = Math.random() < 0.5 ? "rgba(0,0,0,0.10)" : "rgba(255,220,170,0.05)";
+    ctx.strokeStyle = shade;
+    ctx.lineWidth = 1 + Math.random();
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    for (let x = 0; x <= WIDTH; x += 24) {
+      ctx.lineTo(x, y + Math.sin(x * 0.02 + i) * amp);
+    }
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* ================= Декор: кот и мелкие предметы (запекаются один раз) ================= */
+function drawCat(x, y){
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = "#2a2118";
+  ctx.beginPath(); ctx.ellipse(0, -10, 11, 14, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(0, -24, 8, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(-6, -30); ctx.lineTo(-9, -38); ctx.lineTo(-2, -31); ctx.closePath(); ctx.fill();
+  ctx.beginPath(); ctx.moveTo(6, -30); ctx.lineTo(9, -38); ctx.lineTo(2, -31); ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = "#2a2118"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(9, -6); ctx.quadraticCurveTo(20, -10, 17, -24); ctx.stroke();
+  ctx.strokeStyle = "#0e0b08"; ctx.lineWidth = 1.4; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.arc(-3, -24, 2, 0.1 * Math.PI, 0.9 * Math.PI); ctx.stroke();
+  ctx.beginPath(); ctx.arc(3, -24, 2, 0.1 * Math.PI, 0.9 * Math.PI); ctx.stroke();
+  ctx.restore();
+}
+
+function drawInkwell(x, y){
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.fillStyle = "#1c1c1c";
+  ctx.beginPath(); ctx.ellipse(0, 0, 7, 4, 0, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#333"; ctx.fillRect(-5, -6, 10, 6);
+  ctx.strokeStyle = "#d8c39a"; ctx.lineWidth = 1.5;
+  ctx.beginPath(); ctx.moveTo(3, -6); ctx.quadraticCurveTo(10, -16, 6, -24); ctx.stroke();
+  ctx.restore();
+}
+
+function drawScrolls(x, y){
+  ctx.save();
+  ctx.translate(x, y);
+  ["#c9b183", "#d8c39a"].forEach((c, i) => {
+    ctx.fillStyle = c;
+    ctx.save(); ctx.rotate((i - 0.5) * 0.3);
+    ctx.fillRect(-10, -3, 20, 6);
+    ctx.restore();
+  });
+  ctx.restore();
+}
+
+function drawDecor(){
+  drawScrolls(WIDTH * 0.12 + 22, FLOOR0_LEDGE - 6);
+  drawInkwell(WIDTH * 0.88 - 24, FLOOR1_LEDGE - 6);
+  drawCat(LADDER_X + 34, FLOOR0_LEDGE);
+}
+
+/* ================= Запекаем фон + полки + лестницу в offscreen-канвас ================= */
+function bakeStaticLayer(){
+  staticCanvas.width = WIDTH; staticCanvas.height = HEIGHT;
+  const savedCtx = ctx;
+  ctx = sctx;
+
+  const bg = ctx.createLinearGradient(0, 0, 0, HEIGHT);
+  bg.addColorStop(0, "#48311d");
+  bg.addColorStop(0.55, "#2e1c0e");
+  bg.addColorStop(1, "#1c1209");
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+  drawWoodGrain();
+
+  drawShelfZone(0);
+  drawShelfZone(1);
+  drawLadder();
+  drawDecor();
+
+  ctx = savedCtx;
+}
+
+function resizeCanvas(){
+  WIDTH = window.innerWidth > 480 ? 480 : window.innerWidth;
+  HEIGHT = window.innerHeight;
+  canvas.width = WIDTH; canvas.height = HEIGHT;
+  computeLayout();
+}
+
+/* ================= Состояние ================= */
+const BASE_SPEED = 2.4, SPEED_STEP = 0.006, MAX_SPEED = 3.2, MAX_LIVES = 5, BONUS_EVERY = 25, COLLECT_DURATION = 16;
+const SPECIAL_CHANCE = 1 / 17, CURSE_UNLOCK_SCORE = 12, DOUBLE_SCORE_DURATION = 360, SLOW_DURATION = 360, SLOW_FACTOR = 0.5, DOUBLE_DROP_CHANCE = 0;
+const MAX_CONCURRENT = 2;
+const COMBO_STEP = 5, COMBO_MULT_STEP = 0.5, COMBO_MULT_CAP = 3;
+let score = 0, lives = 3, gameOver = false, paused = false;
+let books = [], bookSpeed = BASE_SPEED, spawnTimer = 0, pendingSpawns = [];
+let t = 0, bonusFlash = 0, hitFlash = 0, lastTs = null;
+let combo = 0, doubleScoreTimer = 0, slowTimer = 0, booksCaught = 0;
+let statNormal = 0, statGolden = 0, statSlow = 0, statCursed = 0, bestCombo = 0;
+let scorePopTimer = 0;
+let pageBits = [];
+let lightningTimer = 900 + Math.random() * 900, lightningFlash = 0;
+let PAUSE_BTN = { x: 0, y: 0, r: 18 };
+
+const player = {
+  x:0, y:0, currentSlot:null, facing:1,
+  blinkTimer: 90 + Math.random() * 120, blinkFrames: 0,
+  glanceTimer: 150 + Math.random() * 200, glanceFrames: 0, glanceDir: 0
+};
+
+resizeCanvas();
+player.currentSlot = SLOTS[3];
+player.x = SLOTS[3].x; player.y = SLOTS[3].y;
+
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(resizeCanvas, 150);
+});
+window.addEventListener('orientationchange', () => setTimeout(resizeCanvas, 200));
+
+function goToSlot(target){
+  if (gameOver || target === player.currentSlot) return;
+  if (target.x > player.x) player.facing = 1;
+  else if (target.x < player.x) player.facing = -1;
+  player.currentSlot = target;
+  player.x = target.x;
+  player.y = target.y;
+}
+
+function onTap(clientX, clientY){
+  const tx = clientX - canvas.offsetLeft, ty = clientY - canvas.offsetTop;
+  if (gameOver) { restart(); return; }
+  if (paused) { paused = false; return; }
+  const pdx = tx - PAUSE_BTN.x, pdy = ty - PAUSE_BTN.y;
+  if (pdx * pdx + pdy * pdy <= PAUSE_BTN.r * PAUSE_BTN.r) { paused = true; return; }
+  if (ty < TOP_UI) return;
+  const floor = ty < MID_Y ? 0 : 1;
+  const side = tx < WIDTH / 2 ? 0 : 1;
+  goToSlot(slotFor(floor, side));
+}
+let lastTouchTs = 0;
+canvas.addEventListener('touchstart', (e) => { lastTouchTs = Date.now(); onTap(e.touches[0].clientX, e.touches[0].clientY); }, { passive: true });
+canvas.addEventListener('click', (e) => {
+  if (Date.now() - lastTouchTs < 800) return; // это синтетический click после touchstart — уже обработали
+  onTap(e.clientX, e.clientY);
+});
+
+function restart(){
+  score = 0; lives = 3; bookSpeed = BASE_SPEED; books = []; gameOver = false; bonusFlash = 0;
+  combo = 0; doubleScoreTimer = 0; slowTimer = 0; hitFlash = 0; paused = false; pendingSpawns = []; booksCaught = 0;
+  statNormal = 0; statGolden = 0; statSlow = 0; statCursed = 0; bestCombo = 0; scorePopTimer = 0; pageBits = [];
+  player.currentSlot = SLOTS[3];
+  player.x = SLOTS[3].x; player.y = SLOTS[3].y;
+}
+
+/* ================= Спавн книг ================= */
+const PATTERNS = ["bands", "singleBand", "dot", "doubleBorder", "corner"];
+const SIZES = [
+  { w: 20, h: 30 }, // тонкая
+  { w: 26, h: 34 }, // обычная
+  { w: 26, h: 34 },
+  { w: 32, h: 37 }  // толстая
+];
+
+function pickKind(){
+  if (Math.random() < SPECIAL_CHANCE) {
+    const canCurse = score >= CURSE_UNLOCK_SCORE;
+    const opts = canCurse ? ["golden", "golden", "slow", "slow", "cursed"] : ["golden", "slow"];
+    return opts[Math.floor(Math.random() * opts.length)];
+  }
+  return "normal";
+}
+
+function spawnAt(slot){
+  const centerX = slot.side === 0 ? LEFT_X : RIGHT_X;
+  const size = SIZES[Math.floor(Math.random() * SIZES.length)];
+  const kind = pickKind();
+  const book = {
+    x: centerX - size.w / 2 + (Math.random() - 0.5) * 14,
+    y: laneTop(slot.floor),
+    w: size.w, h: size.h,
+    floor: slot.floor, side: slot.side,
+    kind,
+    c: leather[Math.floor(Math.random() * leather.length)],
+    pattern: PATTERNS[Math.floor(Math.random() * PATTERNS.length)],
+    hasRibbon: Math.random() < 0.7,
+    ribbonColor: Math.random() < 0.75 ? "rgba(212,175,55,0.9)" : "rgba(176,42,42,0.9)",
+    tied: Math.random() < 0.22,
+    resolved: false
+  };
+  if (kind === "golden") { book.c = "#FFF3D0"; book.hasRibbon = true; book.ribbonColor = "rgba(255,200,60,0.95)"; book.tied = false; }
+  else if (kind === "slow") { book.c = "#1C6E8C"; book.tied = false; book.hasRibbon = false; }
+  else if (kind === "cursed") { book.c = "#D91E3C"; book.hasRibbon = false; book.tied = false; }
+  books.push(book);
+}
+
+function spawnRound(){
+  const slot1 = SLOTS[Math.floor(Math.random() * SLOTS.length)];
+  spawnAt(slot1);
+  if (Math.random() < DOUBLE_DROP_CHANCE) {
+    const rest = SLOTS.filter(s => s !== slot1);
+    const slot2 = rest[Math.floor(Math.random() * rest.length)];
+    pendingSpawns.push({ slot: slot2, delay: 22 + Math.random() * 14 });
+  }
+}
+
+/* ================= Книга ================= */
+const HALO_COLOR = { golden: "255,225,140", slow: "150,220,255", cursed: "230,30,50" };
+function drawBook(b){
+  ctx.save();
+  if (b.scale !== undefined && b.scale !== 1) {
+    const ccx = b.x + b.w / 2, ccy = b.y + b.h / 2;
+    ctx.translate(ccx, ccy);
+    ctx.scale(b.scale, b.scale);
+    ctx.translate(-ccx, -ccy);
+    ctx.globalAlpha = Math.max(0, b.scale);
+  }
+
+  // светящийся ореол позади особых книг — пробивает тёплый фон независимо от цвета обложки
+  if (b.kind !== "normal") {
+    const bcx0 = b.x + b.w / 2, bcy0 = b.y + b.h / 2;
+    const haloR = b.w * 2;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    const haloGrad = ctx.createRadialGradient(bcx0, bcy0, 0, bcx0, bcy0, haloR);
+    const hc = HALO_COLOR[b.kind];
+    haloGrad.addColorStop(0, `rgba(${hc},${0.5 + 0.2 * Math.sin(t * 6)})`);
+    haloGrad.addColorStop(1, `rgba(${hc},0)`);
+    ctx.fillStyle = haloGrad;
+    ctx.beginPath(); ctx.arc(bcx0, bcy0, haloR, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  }
+
+  softShadow(6, "rgba(0,0,0,0.5)", 4);
+  ctx.fillStyle = b.c;
+  rr(b.x, b.y, b.w, b.h, 4);
+  ctx.fill();
+  noShadow();
+
+  ctx.save();
+  rr(b.x, b.y, b.w, b.h, 4);
+  ctx.clip();
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.fillRect(b.x, b.y, b.w * 0.4, b.h);
+  ctx.fillStyle = "rgba(0,0,0,0.18)";
+  ctx.fillRect(b.x + b.w * 0.75, b.y, b.w * 0.25, b.h);
+  ctx.restore();
+
+  // узор — только у обычных книг, чтобы не путался с оформлением особых
+  if (b.kind === "normal") {
+    ctx.strokeStyle = "rgba(212,175,55,0.85)";
+    ctx.fillStyle = "rgba(212,175,55,0.85)";
+    ctx.lineWidth = 1.3;
+    const midY = b.y + b.h / 2;
+    if (b.pattern === "bands") {
+      ctx.fillRect(b.x + 4, b.y + b.h * 0.28, b.w - 8, 1.6);
+      ctx.fillRect(b.x + 4, b.y + b.h * 0.72, b.w - 8, 1.6);
+    } else if (b.pattern === "singleBand") {
+      ctx.fillRect(b.x + 4, midY - 1.5, b.w - 8, 3);
+    } else if (b.pattern === "dot") {
+      ctx.beginPath();
+      ctx.arc(b.x + b.w / 2, midY, Math.min(3.2, b.w / 6), 0, Math.PI * 2);
+      ctx.fill();
+    } else if (b.pattern === "doubleBorder") {
+      rr(b.x + 3, b.y + 3, b.w - 6, b.h - 6, 2); ctx.stroke();
+      rr(b.x + 6, b.y + 6, b.w - 12, b.h - 12, 1.5); ctx.stroke();
+    } else if (b.pattern === "corner") {
+      const cl = Math.min(6, b.w / 4);
+      ctx.lineWidth = 1.6;
+      ctx.beginPath(); ctx.moveTo(b.x + 4, b.y + 4 + cl); ctx.lineTo(b.x + 4, b.y + 4); ctx.lineTo(b.x + 4 + cl, b.y + 4); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(b.x + b.w - 4 - cl, b.y + b.h - 4); ctx.lineTo(b.x + b.w - 4, b.y + b.h - 4); ctx.lineTo(b.x + b.w - 4, b.y + b.h - 4 - cl); ctx.stroke();
+    }
+
+    // общая тонкая рамка (кроме doubleBorder, у которой уже своя)
+    if (b.pattern !== "doubleBorder") {
+      ctx.strokeStyle = "rgba(212,175,55,0.5)";
+      ctx.lineWidth = 1;
+      rr(b.x + 3, b.y + 3, b.w - 6, b.h - 6, 2);
+      ctx.stroke();
+    }
+  }
+
+  // срез страниц
+  ctx.fillStyle = "#f0e2b6";
+  rr(b.x + b.w - 5, b.y + 3, 3, b.h - 6, 1.5);
+  ctx.fill();
+
+  // закладка (не всегда)
+  if (b.hasRibbon) {
+    ctx.fillStyle = b.ribbonColor;
+    ctx.beginPath();
+    ctx.moveTo(b.x + 8, b.y + 3);
+    ctx.lineTo(b.x + 15, b.y + 3);
+    ctx.lineTo(b.x + 11.5, b.y + 12);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // верёвочка вокруг книги
+  if (b.tied) {
+    const ty = b.y + b.h * 0.5;
+    ctx.strokeStyle = "#D8C39A";
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(b.x - 1, ty - 6); ctx.lineTo(b.x + b.w + 1, ty - 3); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(b.x - 1, ty + 6); ctx.lineTo(b.x + b.w + 1, ty + 3); ctx.stroke();
+    // бант
+    ctx.fillStyle = "#E8D5A8";
+    ctx.beginPath();
+    ctx.moveTo(b.x + b.w / 2, ty - 4);
+    ctx.lineTo(b.x + b.w / 2 - 5, ty - 8);
+    ctx.lineTo(b.x + b.w / 2 - 5, ty);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(b.x + b.w / 2, ty - 4);
+    ctx.lineTo(b.x + b.w / 2 + 5, ty - 8);
+    ctx.lineTo(b.x + b.w / 2 + 5, ty);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.arc(b.x + b.w / 2, ty - 4, 2, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // особые виды книг — крупный центральный знак + пульсирующая обводка, чтобы читалось на лету
+  const bcx = b.x + b.w / 2, bcy = b.y + b.h / 2;
+  if (b.kind === "golden") {
+    ctx.save();
+    ctx.strokeStyle = `rgba(255,170,30,${0.7 + 0.3 * Math.sin(t * 6)})`;
+    ctx.lineWidth = 2.2;
+    rr(b.x - 1.5, b.y - 1.5, b.w + 3, b.h + 3, 5);
+    ctx.stroke();
+    // звезда по центру — тёмно-янтарная, чтобы читалась на светлой обложке
+    ctx.fillStyle = "rgba(180,110,10,0.95)";
+    ctx.beginPath();
+    const rOuter = Math.min(6, b.w / 3.5), rInner = rOuter * 0.45;
+    for (let k = 0; k < 8; k++) {
+      const ang = k * Math.PI / 4 - Math.PI / 2;
+      const rad = k % 2 === 0 ? rOuter : rInner;
+      const px = bcx + Math.cos(ang) * rad, py = bcy + Math.sin(ang) * rad;
+      if (k === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  } else if (b.kind === "slow") {
+    ctx.save();
+    ctx.strokeStyle = `rgba(170,225,255,${0.55 + 0.35 * Math.sin(t * 5)})`;
+    ctx.lineWidth = 2.2;
+    rr(b.x - 1.5, b.y - 1.5, b.w + 3, b.h + 3, 5);
+    ctx.stroke();
+    // крупная снежинка по центру
+    ctx.strokeStyle = "rgba(225,245,255,0.95)"; ctx.lineWidth = 1.6; ctx.lineCap = "round";
+    const sr = Math.min(7, b.w / 3);
+    ctx.beginPath();
+    for (let a = 0; a < 6; a++) {
+      const ang = a * Math.PI / 3;
+      ctx.moveTo(bcx, bcy);
+      ctx.lineTo(bcx + Math.cos(ang) * sr, bcy + Math.sin(ang) * sr);
+    }
+    ctx.stroke();
+    ctx.restore();
+  } else if (b.kind === "cursed") {
+    ctx.save();
+    ctx.strokeStyle = `rgba(20,10,10,${0.7 + 0.3 * Math.sin(t * 6)})`;
+    ctx.lineWidth = 2.4;
+    rr(b.x - 1.5, b.y - 1.5, b.w + 3, b.h + 3, 5);
+    ctx.stroke();
+    // жирный тёмный крест по центру — контраст с ярко-алой обложкой, однозначный знак опасности
+    ctx.strokeStyle = "rgba(15,8,8,0.95)"; ctx.lineWidth = 2.8; ctx.lineCap = "round";
+    const xr = Math.min(7, b.w / 3);
+    ctx.beginPath();
+    ctx.moveTo(bcx - xr, bcy - xr); ctx.lineTo(bcx + xr, bcy + xr);
+    ctx.moveTo(bcx + xr, bcy - xr); ctx.lineTo(bcx - xr, bcy + xr);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+function drawCandle(x, y, flicker){
+  ctx.fillStyle = "#3a2a18";
+  ctx.fillRect(x - 7, y, 14, 5);
+  ctx.fillStyle = "#B7863B";
+  ctx.fillRect(x - 2.5, y - 16, 5, 16);
+  const fh = 8 + flicker * 3;
+  ctx.save();
+  softShadow(9, "rgba(255,180,90,0.9)", 0);
+  ctx.fillStyle = "#FFD87A";
+  ctx.beginPath();
+  ctx.moveTo(x, y - 16 - fh);
+  ctx.quadraticCurveTo(x + 4.5, y - 16 - fh * 0.4, x, y - 16);
+  ctx.quadraticCurveTo(x - 4.5, y - 16 - fh * 0.4, x, y - 16 - fh);
+  ctx.fill();
+  noShadow();
+  ctx.fillStyle = "#FFF3D0";
+  ctx.beginPath();
+  ctx.ellipse(x, y - 16 - fh * 0.45, 1.6, fh * 0.32, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function flickerFor(i){ return 0.55 + 0.22 * Math.sin(t * 1.6 + i * 1.7); }
+
+function drawGlowAndCandles(){
+  glowSpots.forEach((g, i) => {
+    const flicker = flickerFor(i);
+    ctx.save();
+    ctx.globalAlpha = 0.3 * flicker;
+    ctx.drawImage(glowSprite, g.x - g.r, g.glowY - g.r, g.r * 2, g.r * 2);
+    ctx.restore();
+    drawCandle(g.x, g.baseY, flicker);
+  });
+}
+
+/* Лёгкий аддитивный засвет поверх книг и персонажа — свечи реально освещают то, что рядом */
+function drawLightSpill(){
+  glowSpots.forEach((g, i) => {
+    const flicker = flickerFor(i);
+    const r = g.r * 0.75;
+    ctx.save();
+    ctx.globalCompositeOperation = "lighter";
+    ctx.globalAlpha = 0.14 * flicker;
+    ctx.drawImage(glowSprite, g.x - r, g.glowY - r, r * 2, r * 2);
+    ctx.restore();
+  });
+}
+
+function updateAndDrawDust(){
+  ctx.save();
+  dustParticles.forEach(p => {
+    const dx = Math.sin(t * p.speed + p.phase) * p.drift;
+    const dy = Math.cos(t * p.speed * 0.7 + p.phase) * p.drift * 0.6;
+    const alpha = 0.18 + 0.14 * Math.sin(t * p.speed * 1.3 + p.phase * 2);
+    ctx.fillStyle = `rgba(255,224,170,${Math.max(0, alpha)})`;
+    ctx.beginPath();
+    ctx.arc(p.baseX + dx, p.baseY + dy, p.size, 0, Math.PI * 2);
+    ctx.fill();
+  });
+  ctx.restore();
+}
+
+/* Разлетающиеся странички в момент поимки */
+function spawnPageBits(x, y){
+  const n = 2 + Math.floor(Math.random() * 2);
+  for (let i = 0; i < n; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const spd = 1.2 + Math.random() * 1.6;
+    pageBits.push({
+      x, y,
+      vx: Math.cos(ang) * spd, vy: Math.sin(ang) * spd - 1.2,
+      rot: Math.random() * Math.PI, rotSpeed: (Math.random() - 0.5) * 0.3,
+      life: 22, maxLife: 22
+    });
+  }
+}
+function updateAndDrawPageBits(dt){
+  for (let i = pageBits.length - 1; i >= 0; i--) {
+    const p = pageBits[i];
+    p.life -= dt;
+    if (p.life <= 0) { pageBits.splice(i, 1); continue; }
+    p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 0.08 * dt; p.rot += p.rotSpeed * dt;
+    const alpha = Math.max(0, p.life / p.maxLife);
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    ctx.rotate(p.rot);
+    ctx.fillStyle = `rgba(240,226,182,${alpha * 0.9})`;
+    ctx.fillRect(-3, -2, 6, 4);
+    ctx.restore();
+  }
+}
+
+function drawSpine(s, dim){
+  ctx.save();
+  if (s.tilt) {
+    ctx.translate(s.x + s.w / 2, s.bottomY);
+    ctx.rotate(s.tilt);
+    ctx.translate(-(s.x + s.w / 2), -s.bottomY);
+  }
+  const y = s.bottomY - s.h;
+
+  ctx.fillStyle = s.color;
+  rr(s.x, y, s.w, s.h, { tl:3, tr:3, br:0, bl:0 });
+  ctx.fill();
+
+  if (!dim) {
+    ctx.fillStyle = "rgba(255,255,255,0.16)";
+    ctx.fillRect(s.x + 1.2, y + 2, 1.3, s.h - 4);
+  }
+
+  ctx.fillStyle = dim ? "rgba(0,0,0,0.55)" : "rgba(0,0,0,0.4)";
+  ctx.fillRect(s.x + s.w - 1.3, y, 1.3, s.h);
+
+  if (s.bands) {
+    ctx.fillStyle = "rgba(212,175,55,0.8)";
+    ctx.fillRect(s.x + 2, y + 5, s.w - 4, 1.4);
+    ctx.fillRect(s.x + 2, y + s.h - 8, s.w - 4, 1.4);
+  }
+  if (s.midDot) {
+    ctx.fillStyle = "rgba(212,175,55,0.7)";
+    ctx.beginPath();
+    ctx.arc(s.x + s.w / 2, y + s.h / 2, Math.min(2.2, s.w / 5), 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function drawShelfZone(floor){
+  const top = laneTop(floor);
+  const bottom = ledgeY(floor);
+
+  ctx.fillStyle = "rgba(60,38,20,0.55)";
+  ctx.fillRect(0, top - 8, WIDTH, bottom - top + 26);
+
+  const rows = shelfRows[floor];
+  rows.forEach((row) => {
+    row.back.forEach(s => drawSpine(s, true));
+    row.front.forEach(s => drawSpine(s, false));
+    if (!row.isLast) {
+      ctx.fillStyle = "rgba(25,15,8,0.65)";
+      ctx.fillRect(0, row.bottomY + 2, WIDTH, 3);
+      ctx.fillStyle = "rgba(120,80,40,0.3)";
+      ctx.fillRect(0, row.bottomY + 1, WIDTH, 1);
+    }
+  });
+
+  ctx.fillStyle = "rgba(10,6,3,0.22)";
+  ctx.fillRect(0, top - 8, WIDTH, bottom - top - 22);
+
+  ctx.save();
+  softShadow(8, "rgba(0,0,0,0.5)", 4);
+  ctx.fillStyle = "#4a2f18";
+  rr(4, bottom, WIDTH - 8, 10, 4);
+  ctx.fill();
+  noShadow();
+  ctx.fillStyle = "#D4AF37";
+  rr(4, bottom, WIDTH - 8, 3, 2);
+  ctx.fill();
+  ctx.restore();
+}
+
+/* ================= Кнопка паузы ================= */
+function drawPauseButton(){
+  const px = PAUSE_BTN.x, py = PAUSE_BTN.y, r = PAUSE_BTN.r;
+  ctx.save();
+  ctx.fillStyle = "rgba(255,255,255,0.12)";
+  ctx.beginPath(); ctx.arc(px, py, r, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "rgba(212,175,55,0.5)"; ctx.lineWidth = 1; ctx.stroke();
+  ctx.fillStyle = "#D4AF37";
+  if (paused) {
+    ctx.beginPath(); ctx.moveTo(px - 4, py - 6); ctx.lineTo(px - 4, py + 6); ctx.lineTo(px + 6, py); ctx.closePath(); ctx.fill();
+  } else {
+    ctx.fillRect(px - 6, py - 6, 4, 12);
+    ctx.fillRect(px + 2, py - 6, 4, 12);
+  }
+  ctx.restore();
+}
+
+/* ================= Лестница ================= */
+function drawLadder(){
+  const topY = FLOOR0_LEDGE, botY = FLOOR1_TOP;
+  ctx.save();
+  softShadow(5, "rgba(0,0,0,0.4)", 2);
+  ctx.strokeStyle = "#8a5a30"; ctx.lineWidth = 5; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(LADDER_X - 14, topY); ctx.lineTo(LADDER_X - 14, botY); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(LADDER_X + 14, topY); ctx.lineTo(LADDER_X + 14, botY); ctx.stroke();
+  noShadow();
+  ctx.strokeStyle = "#c8925c"; ctx.lineWidth = 4;
+  const rungs = 4;
+  for (let i = 1; i < rungs; i++) {
+    const ry = topY + (botY - topY) * (i / rungs);
+    ctx.beginPath(); ctx.moveTo(LADDER_X - 14, ry); ctx.lineTo(LADDER_X + 14, ry); ctx.stroke();
+  }
+  ctx.restore();
+}
+
+/* ================= Библиотекарь ================= */
+function drawLibrarian(){
+  const standY = player.y - 1;
+  const cx = player.x;
+  const dir = player.facing;
+  const breathe = Math.sin(t * 1.8) * 1.1;
+
+  ctx.save();
+  ctx.fillStyle = "rgba(0,0,0,0.4)";
+  ctx.beginPath();
+  ctx.ellipse(cx, standY + 3, 20, 5.5, 0, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  ctx.save();
+  ctx.translate(cx, standY);
+
+  const cartX = -dir * 32;
+  ctx.save();
+  ctx.translate(cartX, 0);
+  ctx.fillStyle = "#2b1c10";
+  ctx.beginPath(); ctx.arc(-9, 1, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(9, 1, 5, 0, Math.PI * 2); ctx.fill();
+  ctx.save();
+  softShadow(5, "rgba(0,0,0,0.45)", 3);
+  ctx.fillStyle = "#5a3a1e";
+  rr(-16, -27, 32, 27, 5);
+  ctx.fill();
+  noShadow();
+  ctx.restore();
+  ctx.strokeStyle = "rgba(212,175,55,0.7)"; ctx.lineWidth = 1.5;
+  rr(-16, -27, 32, 27, 5); ctx.stroke();
+  ctx.fillStyle = "rgba(0,0,0,0.25)";
+  ctx.fillRect(-13, -5, 7, 2); ctx.fillRect(-4, -5, 7, 2); ctx.fillRect(5, -5, 7, 2);
+  ctx.fillStyle = "#7B241C"; rr(-12, -24, 7, 19, 2); ctx.fill();
+  ctx.fillStyle = "#1B4F72"; rr(-3, -22, 7, 17, 2); ctx.fill();
+  ctx.fillStyle = "#145A32"; rr(5, -24, 7, 19, 2); ctx.fill();
+  ctx.strokeStyle = "#4a2f18"; ctx.lineWidth = 4; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(dir * 16, -17); ctx.lineTo(0, -13); ctx.stroke();
+  ctx.restore();
+
+  ctx.strokeStyle = "#2b1c10"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-7, -16); ctx.lineTo(-7, 0); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(7, -16); ctx.lineTo(7, 0); ctx.stroke();
+
+  ctx.save();
+  ctx.translate(0, breathe * 0.5);
+
+  ctx.save();
+  softShadow(5, "rgba(0,0,0,0.35)", 2);
+  const bodyGrad = ctx.createLinearGradient(-15, -45, 15, -14);
+  bodyGrad.addColorStop(0, "#87393a");
+  bodyGrad.addColorStop(0.55, "#6E2C2C");
+  bodyGrad.addColorStop(1, "#4f1f1f");
+  ctx.fillStyle = bodyGrad;
+  rr(-15, -45 - breathe * 0.6, 30, 31 + breathe * 0.6, { tl:12, tr:12, br:6, bl:6 });
+  ctx.fill();
+  noShadow();
+  ctx.restore();
+  ctx.strokeStyle = "rgba(212,175,55,0.5)"; ctx.lineWidth = 1.2;
+  ctx.beginPath(); ctx.moveTo(0, -45); ctx.lineTo(0, -14); ctx.stroke();
+
+  // складки мантии
+  ctx.strokeStyle = "rgba(0,0,0,0.18)"; ctx.lineWidth = 1; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-9, -32); ctx.quadraticCurveTo(-11, -24, -8, -16); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(9, -32); ctx.quadraticCurveTo(11, -24, 8, -16); ctx.stroke();
+
+  ctx.strokeStyle = "#6E2C2C"; ctx.lineWidth = 7; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(-13, -41); ctx.lineTo(-20 - dir * 2, -27); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(13, -41); ctx.lineTo(20 + dir * 2, -27); ctx.stroke();
+  ctx.fillStyle = "#E5B78A";
+  ctx.beginPath(); ctx.arc(-20 - dir * 2, -27, 4, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(20 + dir * 2, -27, 4, 0, Math.PI * 2); ctx.fill();
+
+  ctx.fillStyle = "#D4AF37";
+  ctx.beginPath();
+  ctx.moveTo(-6, -45); ctx.lineTo(6, -45); ctx.lineTo(4, -39); ctx.lineTo(-4, -39);
+  ctx.closePath(); ctx.fill();
+
+  ctx.save();
+  softShadow(4, "rgba(0,0,0,0.3)", 2);
+  const headGrad = ctx.createRadialGradient(-3, -58, 2, 0, -55, 12);
+  headGrad.addColorStop(0, "#F2C79A");
+  headGrad.addColorStop(1, "#D49C6E");
+  ctx.fillStyle = headGrad;
+  ctx.beginPath(); ctx.arc(0, -55, 11.5, 0, Math.PI * 2); ctx.fill();
+  noShadow();
+  ctx.restore();
+
+  ctx.fillStyle = "#3d2b1f";
+  ctx.beginPath(); ctx.arc(0, -62, 10, Math.PI, 2 * Math.PI); ctx.fill();
+  ctx.beginPath(); ctx.arc(0, -70, 4.3, 0, Math.PI * 2); ctx.fill();
+
+  // взгляд по сторонам
+  const glanceOffset = player.glanceFrames > 0 ? player.glanceDir * 2 : 0;
+  if (player.blinkFrames > 0) {
+    // моргание — глаза закрыты
+    ctx.strokeStyle = "#2a1c12"; ctx.lineWidth = 1.4; ctx.lineCap = "round";
+    ctx.beginPath(); ctx.moveTo(-5.2 + glanceOffset, -55); ctx.lineTo(-2.8 + glanceOffset, -55); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(2.8 + glanceOffset, -55); ctx.lineTo(5.2 + glanceOffset, -55); ctx.stroke();
+  } else {
+    ctx.fillStyle = "#2a1c12";
+    ctx.beginPath(); ctx.arc(-4 + glanceOffset, -55, 1.5, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath(); ctx.arc(4 + glanceOffset, -55, 1.5, 0, Math.PI * 2); ctx.fill();
+  }
+  ctx.strokeStyle = "#2a1c12"; ctx.lineWidth = 1.3; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.arc(0, -52, 3.6, 0.15 * Math.PI, 0.85 * Math.PI); ctx.stroke();
+
+  ctx.restore();
+  ctx.restore();
+}
+
+/* ================= Игровой цикл ================= */
+function loop(now){
+  if (lastTs === null) lastTs = now;
+  let dt = paused ? 0 : (now - lastTs) / (1000 / 60);
+  dt = Math.max(0, Math.min(dt, 3)); // защита от скачка после сворачивания вкладки/лагов
+  lastTs = now;
+
+  t += 0.02 * dt;
+  ctx.drawImage(staticCanvas, 0, 0);
+  drawGlowAndCandles();
+  updateAndDrawDust();
+
+  if (!gameOver) {
+    spawnTimer += dt * (slowTimer > 0 ? SLOW_FACTOR : 1);
+    const activeFalling = books.reduce((n, b) => n + (b.collecting ? 0 : 1), 0);
+    if (spawnTimer > Math.max(30, 68 - booksCaught)) {
+      if (activeFalling < MAX_CONCURRENT) { spawnTimer = 0; spawnRound(); }
+      else { spawnTimer = Math.max(30, 68 - booksCaught); } // ждём на пороге, чтобы спавнить сразу, как только освободится место
+    }
+
+    for (let i = pendingSpawns.length - 1; i >= 0; i--) {
+      pendingSpawns[i].delay -= dt;
+      if (pendingSpawns[i].delay <= 0) { spawnAt(pendingSpawns[i].slot); pendingSpawns.splice(i, 1); }
+    }
+
+    for (let i = books.length - 1; i >= 0; i--) {
+      const b = books[i];
+
+      if (b.collecting) {
+        b.collectFrames -= dt;
+        const progress = 1 - b.collectFrames / COLLECT_DURATION;
+        const ease = progress * progress * (3 - 2 * progress);
+        b.x = b.startX + (b.targetX - b.startX) * ease;
+        b.y = b.startY + (b.targetY - b.startY) * ease;
+        b.scale = 1 - 0.72 * ease;
+        if (b.collectFrames <= 0) books.splice(i, 1);
+        continue;
+      }
+
+      const effSpeed = bookSpeed * (slowTimer > 0 ? SLOW_FACTOR : 1);
+      b.y += effSpeed * dt;
+      const target = ledgeY(b.floor);
+      if (!b.resolved && b.y + b.h >= target) {
+        b.resolved = true;
+        const caught = player.currentSlot && player.currentSlot.floor === b.floor && player.currentSlot.side === b.side;
+
+        if (b.kind === "cursed") {
+          if (caught) {
+            lives--; combo = 0; hitFlash = 20; statCursed++;
+            if (lives <= 0) gameOver = true;
+          }
+          books.splice(i, 1);
+        } else if (caught) {
+          combo++;
+          booksCaught++;
+          bestCombo = Math.max(bestCombo, combo);
+          if (b.kind === "golden") statGolden++; else if (b.kind === "slow") statSlow++; else statNormal++;
+          const comboMult = 1 + Math.min(COMBO_MULT_CAP - 1, Math.floor(combo / COMBO_STEP) * COMBO_MULT_STEP);
+          const scoreMult = comboMult * (doubleScoreTimer > 0 ? 2 : 1);
+          score += Math.round(scoreMult);
+          scorePopTimer = 14;
+          spawnPageBits(b.x + b.w / 2, b.y + b.h / 2);
+          bookSpeed = Math.min(bookSpeed + SPEED_STEP, MAX_SPEED);
+          if (booksCaught % BONUS_EVERY === 0 && lives < MAX_LIVES) { lives++; bonusFlash = 70; }
+          if (b.kind === "golden") doubleScoreTimer = DOUBLE_SCORE_DURATION;
+          if (b.kind === "slow") slowTimer = SLOW_DURATION;
+          b.collecting = true;
+          b.collectFrames = COLLECT_DURATION;
+          b.startX = b.x; b.startY = b.y;
+          b.targetX = player.x - player.facing * 32;
+          b.targetY = player.y - 20;
+        } else {
+          lives--; combo = 0; if (lives <= 0) gameOver = true;
+          books.splice(i, 1);
+        }
+      }
+    }
+  }
+
+  updateAndDrawPageBits(dt);
+  books.forEach(drawBook);
+
+  player.blinkTimer -= dt;
+  if (player.blinkTimer <= 0) { player.blinkFrames = 6; player.blinkTimer = 90 + Math.random() * 150; }
+  if (player.blinkFrames > 0) player.blinkFrames -= dt;
+
+  player.glanceTimer -= dt;
+  if (player.glanceTimer <= 0 && player.glanceFrames <= 0) {
+    player.glanceFrames = 45; player.glanceDir = Math.random() < 0.5 ? -1 : 1;
+    player.glanceTimer = 180 + Math.random() * 220;
+  }
+  if (player.glanceFrames > 0) player.glanceFrames -= dt;
+
+  if (doubleScoreTimer > 0) doubleScoreTimer -= dt;
+  if (slowTimer > 0) slowTimer -= dt;
+
+  lightningTimer -= dt;
+  if (lightningTimer <= 0) { lightningFlash = 1; lightningTimer = 900 + Math.random() * 1500; }
+  if (lightningFlash > 0) lightningFlash = Math.max(0, lightningFlash - dt * 0.08);
+
+  drawLibrarian();
+  drawLightSpill();
+
+  if (lightningFlash > 0) {
+    ctx.save();
+    ctx.fillStyle = `rgba(210,225,255,${lightningFlash * 0.3})`;
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.restore();
+  }
+  if (hitFlash > 0) {
+    hitFlash -= dt;
+    ctx.save();
+    ctx.fillStyle = `rgba(180,20,20,${Math.max(0, Math.min(1, hitFlash / 20)) * 0.3})`;
+    ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.restore();
+  }
+
+  ctx.fillStyle = vignette;
+  ctx.fillRect(0, 0, WIDTH, HEIGHT);
+
+  ctx.drawImage(uiBarCanvas, 0, 0);
+
+  if (scorePopTimer > 0) scorePopTimer -= dt;
+  const scorePop = scorePopTimer > 0 ? 1 + 0.22 * (scorePopTimer / 14) : 1;
+  ctx.fillStyle = "#D4AF37"; ctx.font = "bold 19px Georgia, serif"; ctx.textAlign = "left";
+  ctx.save();
+  ctx.translate(16, 34);
+  ctx.scale(scorePop, scorePop);
+  ctx.fillText(`📚 ${score}`, 0, 0);
+  ctx.restore();
+  ctx.textAlign = "right";
+  ctx.fillText(`${"❤️".repeat(Math.max(lives, 0))}`, WIDTH - 16, 34);
+  ctx.textAlign = "left";
+
+  const comboMultDisplay = 1 + Math.min(COMBO_MULT_CAP - 1, Math.floor(combo / COMBO_STEP) * COMBO_MULT_STEP);
+  if (comboMultDisplay > 1) {
+    ctx.fillStyle = "#FF8A3D"; ctx.font = "12px Georgia, serif"; ctx.textAlign = "left";
+    ctx.fillText(`🔥 ×${comboMultDisplay.toFixed(1)}`, 16, 48);
+    ctx.textAlign = "left";
+  }
+  if (doubleScoreTimer > 0 || slowTimer > 0) {
+    ctx.font = "12px Georgia, serif"; ctx.textAlign = "right";
+    ctx.fillStyle = "#FFE28A";
+    const buffText = (doubleScoreTimer > 0 ? "✨×2 " : "") + (slowTimer > 0 ? "❄️" : "");
+    ctx.fillText(buffText.trim(), WIDTH - 16, 48);
+    ctx.textAlign = "left";
+  }
+
+  drawPauseButton();
+
+  if (bonusFlash > 0) {
+    bonusFlash -= dt;
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, bonusFlash / 30);
+    ctx.fillStyle = "#FFD87A"; ctx.textAlign = "center";
+    ctx.font = "bold 16px Georgia, serif";
+    ctx.fillText("+1 жизнь!", WIDTH / 2, TOP_UI + 22);
+    ctx.textAlign = "left";
+    ctx.restore();
+  }
+
+  if (gameOver) {
+    ctx.fillStyle = "rgba(10,6,3,0.88)"; ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.fillStyle = "#D4AF37"; ctx.textAlign = "center";
+    ctx.font = "bold 26px Georgia, serif"; ctx.fillText("Книги рассыпаны...", WIDTH / 2, HEIGHT / 2 - 58);
+    ctx.fillStyle = "#f0e2b6";
+    ctx.font = "17px Georgia, serif"; ctx.fillText(`Поймано книг: ${score}`, WIDTH / 2, HEIGHT / 2 - 26);
+
+    ctx.font = "13px Georgia, serif"; ctx.fillStyle = "rgba(240,226,182,0.85)";
+    ctx.fillText(`📖 Обычных: ${statNormal}   🌟 Золотых: ${statGolden}   ❄️ Ледяных: ${statSlow}`, WIDTH / 2, HEIGHT / 2 + 2);
+    ctx.fillStyle = "rgba(230,120,120,0.85)";
+    ctx.fillText(`💀 Проклятых поймано: ${statCursed}     🔥 Лучшее комбо: ×${(1 + Math.min(COMBO_MULT_CAP - 1, Math.floor(bestCombo / COMBO_STEP) * COMBO_MULT_STEP)).toFixed(1)}`, WIDTH / 2, HEIGHT / 2 + 22);
+
+    ctx.font = "14px Georgia, serif"; ctx.fillStyle = "rgba(240,226,182,0.75)";
+    ctx.fillText("Нажми, чтобы начать заново", WIDTH / 2, HEIGHT / 2 + 56);
+    ctx.textAlign = "left";
+  } else if (paused) {
+    ctx.fillStyle = "rgba(10,6,3,0.55)"; ctx.fillRect(0, 0, WIDTH, HEIGHT);
+    ctx.fillStyle = "#D4AF37"; ctx.textAlign = "center";
+    ctx.font = "bold 24px Georgia, serif"; ctx.fillText("Пауза", WIDTH / 2, HEIGHT / 2 - 6);
+    ctx.font = "14px Georgia, serif"; ctx.fillStyle = "rgba(240,226,182,0.8)";
+    ctx.fillText("Нажми, чтобы продолжить", WIDTH / 2, HEIGHT / 2 + 20);
+    ctx.textAlign = "left";
+  }
+
+  requestAnimationFrame(loop);
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
